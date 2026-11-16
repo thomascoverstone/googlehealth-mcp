@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "googlehealth-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "MCP_OBJECT", "class_name": "GoogleHealthMCP" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GoogleHealthMCP"] }],
+  "kv_namespaces": [{ "binding": "TOKENS", "id": "REPLACE_WITH_KV_ID" }],
+  "vars": {
+    // Optional https origin of the worker. Leave empty: the worker uses the origin each
+    // request arrives on, which keeps account-specific hostnames out of this file.
+    "PUBLIC_URL": "",
+    // Space separated scope override; leave empty for the defaults in src/health.ts.
+    // Example: "activity_and_fitness.readonly health_metrics_and_measurements.readonly sleep.readonly nutrition.readonly"
+    "SCOPES": "",
+    // IANA zone used for 'today' when the settings scope was not granted.
+    "DEFAULT_TIMEZONE": "America/New_York"
+  }
+}
