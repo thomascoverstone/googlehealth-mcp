@@ -19,7 +19,7 @@ export interface Env {
   GOOGLE_CLIENT_SECRET: string;
   /** Long random string that must appear in the URL path (/mcp/<key>). */
   ACCESS_KEY: string;
-  /** Public https URL of this worker, used in help messages. */
+  /** Public https URL of this worker for login links (default: the URL the request came in on). */
   PUBLIC_URL?: string;
   /** Optional space/comma separated scope override (short names accepted). */
   SCOPES?: string;
@@ -185,7 +185,6 @@ const DATA_TYPE_ALIASES: Record<string, string> = {
   calories: "total-calories",
   calories_burned: "total-calories",
   active_calories: "active-energy-burned",
-  bmr: "basal-energy-burned",
   workouts: "exercise",
   workout: "exercise",
   activities: "exercise",
@@ -257,17 +256,34 @@ export function ecgFilter(start: Date): string {
 }
 
 // --------------------------------------------------------------------------
-// Token storage (KV)
+// Login link
 // --------------------------------------------------------------------------
 
-export function loginUrl(env: Env): string {
-  const base = env.PUBLIC_URL || "https://<your-worker-url>";
-  return `${base.replace(/\/$/, "")}/auth/${env.ACCESS_KEY}`;
+/**
+ * The path segment of the login link, /auth/<login key>. It is derived from ACCESS_KEY, so it needs
+ * no secret of its own, and it differs from ACCESS_KEY, so a login link shown in tool output (and so
+ * in chat transcripts) does not give away the connector URL. scripts/setup.mjs derives the same value:
+ * HMAC-SHA256(key = ACCESS_KEY, message = "login-link-v1"), first 24 bytes, base64url.
+ */
+export async function loginKey(accessKey: string): Promise<string> {
+  const enc = new TextEncoder();
+  const hmac = await crypto.subtle.importKey("raw", enc.encode(accessKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", hmac, enc.encode("login-link-v1")));
+  return btoa(String.fromCharCode(...mac.subarray(0, 24))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-export function authHelp(env: Env): string {
-  return `Log in to Google Health by opening ${loginUrl(env)} in a browser.`;
+export async function loginUrl(env: Env): Promise<string> {
+  const base = (env.PUBLIC_URL || "https://<your-worker-url>").replace(/\/+$/, "");
+  return `${base}/auth/${await loginKey(env.ACCESS_KEY)}`;
 }
+
+async function authHelp(env: Env): Promise<string> {
+  return `Log in to Google Health by opening ${await loginUrl(env)} in a browser.`;
+}
+
+// --------------------------------------------------------------------------
+// Token storage (KV)
+// --------------------------------------------------------------------------
 
 export async function loadTokens(env: Env): Promise<Tokens | null> {
   return (await env.TOKENS.get<Tokens>(TOKEN_KEY, "json")) ?? null;
@@ -438,7 +454,7 @@ export class HealthClient {
 
   private async doRefresh(): Promise<Tokens> {
     const stored = await loadTokens(this.env);
-    if (!stored) throw new NotAuthorizedError(`No Google Health login saved yet. ${authHelp(this.env)}`);
+    if (!stored) throw new NotAuthorizedError(`No Google Health login saved yet. ${await authHelp(this.env)}`);
     try {
       const body = await this.tokenRequest({
         grant_type: "refresh_token",
@@ -459,13 +475,13 @@ export class HealthClient {
         ? " The refresh token is no longer valid: Google expires them after 7 days while the Cloud " +
           "project's OAuth consent screen is in 'Testing', after 6 months without use, or when access is revoked."
         : "";
-      throw new NotAuthorizedError(`The saved Google Health login could not be refreshed (${msg}).${why} ${authHelp(this.env)}`);
+      throw new NotAuthorizedError(`The saved Google Health login could not be refreshed (${msg}).${why} ${await authHelp(this.env)}`);
     }
   }
 
   async accessToken(force = false): Promise<string> {
     if (!this.tokens) this.tokens = await loadTokens(this.env);
-    if (!this.tokens) throw new NotAuthorizedError(`No Google Health login saved yet. ${authHelp(this.env)}`);
+    if (!this.tokens) throw new NotAuthorizedError(`No Google Health login saved yet. ${await authHelp(this.env)}`);
     const remaining = this.tokens.expires_at - nowS();
     if (force || remaining < REFRESH_MARGIN_S) {
       const fresh = await loadTokens(this.env);

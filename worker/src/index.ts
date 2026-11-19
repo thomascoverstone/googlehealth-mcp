@@ -1,13 +1,13 @@
 /**
  * Google Health MCP server as a Cloudflare Worker (remote MCP, streamable HTTP).
  *
- * Routes (everything except / and /callback is behind the secret ACCESS_KEY):
+ * Routes (everything except / and /callback needs a secret in the path):
  *   GET  /                    liveness text
  *   GET  /callback            Google OAuth redirect target: exchanges the code, stores tokens in KV
- *   GET  /auth/<ACCESS_KEY>   starts the Google login (redirects to the consent page)
- *   POST /mcp/<ACCESS_KEY>    MCP endpoint (stateless streamable HTTP) - add this URL as a custom connector
+ *   GET  /auth/<login key>    starts the Google login (redirects to the consent page); the
+ *                             login key is derived from ACCESS_KEY, see loginKey() in health.ts
+ *   POST /mcp/<ACCESS_KEY>    MCP endpoint (stateless streamable HTTP): the custom connector URL
  *   GET  /mcp/<ACCESS_KEY>    405: no event stream, so idle clients have nothing to keep open
- *   *    /sse/<ACCESS_KEY>    410: the legacy SSE transport was retired on 2026-11-15
  */
 import { DurableObject } from "cloudflare:workers";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -30,6 +30,8 @@ import {
   instantToLocal,
   loadTokens,
   localIso,
+  loginKey,
+  loginUrl,
   minutes,
   num,
   r1,
@@ -854,7 +856,7 @@ class GoogleHealthServer {
         description:
           "Escape hatch: list the raw data points of any readable Google Health data type for a range of " +
           "days, with times converted to the user's local time. Types: steps, distance, floors (reconcile " +
-          "only), altitude, active-energy-burned, basal-energy-burned, active-minutes, active-zone-minutes, " +
+          "only), altitude, active-energy-burned, active-minutes, active-zone-minutes, " +
           "activity-level, sedentary-period, swim-lengths-data, time-in-heart-rate-zone, heart-rate (per " +
           "sample), heart-rate-variability, oxygen-saturation, respiratory-rate-sleep-summary, vo2-max, " +
           "run-vo2-max, core-body-temperature, blood-glucose, weight, body-fat, height, daily-resting-heart-rate, " +
@@ -1044,7 +1046,7 @@ class GoogleHealthServer {
       async ({ verify }) => {
         const requested = requestedScopes(env).map(shortScope);
         const info: Record<string, unknown> = {
-          login_url: `${env.PUBLIC_URL ?? ""}/auth/${env.ACCESS_KEY}`,
+          login_url: await loginUrl(env),
           requested_scopes: requested,
         };
         try {
@@ -1096,15 +1098,11 @@ class GoogleHealthServer {
 }
 
 /**
- * The MCP endpoint's Durable Object. Every client shares ONE instance ("shared") and nothing is
- * written to its storage, so it uses no Durable Object rows. Tool calls run here rather than in
- * the Worker only to keep the Durable Object CPU budget (Free plan Workers get 10 ms of CPU, and
- * intraday or long-range queries need more).
- *
- * Until 2026-11-15 this class was an agents McpAgent: one new Durable Object per MCP session,
- * roughly 60 SQLite rows written each time. Claude Code re-initialises an open session every
- * ~18 minutes when Cloudflare drops its idle event stream, and with many sessions open that
- * reached 90% of the Free plan's 100,000 rows written per day.
+ * The MCP endpoint's Durable Object. Every client shares ONE instance ("shared") and the server is
+ * stateless (a fresh McpServer per request, no session ids), so nothing is written to Durable
+ * Object storage and the Free plan's daily row-write limit is never touched. Tool calls run here
+ * rather than in the Worker only to get the Durable Object CPU budget (Free plan Workers get 10 ms
+ * of CPU per request, and intraday or long-range queries need more).
  */
 export class GoogleHealthMCP extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
@@ -1121,9 +1119,6 @@ export class GoogleHealthMCP extends DurableObject<Env> {
       await mcp.server.close();
     }
   }
-
-  /** Objects left from the per-session design may still hold a keep-alive alarm: let it lapse. */
-  async alarm(): Promise<void> {}
 }
 
 // --------------------------------------------------------------------------
@@ -1207,26 +1202,30 @@ async function handleCallback(url: URL, env: Env): Promise<Response> {
   }
 }
 
+/** Constant-time comparison for the secrets in the URL path. */
+function sameSecret(given: string, expected: string): boolean {
+  const a = new TextEncoder().encode(given);
+  const b = new TextEncoder().encode(expected);
+  return a.byteLength === b.byteLength && crypto.subtle.timingSafeEqual(a, b);
+}
+
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
-    const key = env.ACCESS_KEY;
 
     if (path === "/") return new Response("googlehealth-mcp is running.\n", { headers: { "content-type": "text/plain" } });
     if (path === "/callback") {
       if (request.method === "HEAD") return new Response(null, { status: 200 });
       return handleCallback(url, env);
     }
+    const key = env.ACCESS_KEY;
     if (!key || key.length < 12) return new Response("Worker is not configured: ACCESS_KEY secret missing.", { status: 500 });
 
-    if (path === `/auth/${key}`) return startLogin(url, env);
-
-    const mcpPath = `/mcp/${key}`;
-    const ssePath = `/sse/${key}`;
-    if (path === mcpPath) return handleMcp(request, env);
-    if (path === ssePath || path === `${ssePath}/message`) {
-      return new Response("The legacy SSE endpoint was retired; use /mcp/<key>.\n", { status: 410 });
+    const [, route, secret, ...rest] = path.split("/");
+    if (secret && rest.length === 0) {
+      if (route === "mcp" && sameSecret(secret, key)) return handleMcp(request, env);
+      if (route === "auth" && sameSecret(secret, await loginKey(key))) return startLogin(url, env);
     }
     return new Response("Not found", { status: 404 });
   },
